@@ -1,0 +1,391 @@
+---
+title: "Butterfly species data processing for species distribution modelling"
+author: "Martha Ledger"
+date: "3/28/2023"
+output:
+  html_document: default
+---
+
+#**Introduction**
+This script reads butterfly species points, produces pseudo-absences, then calculates LiDAR metrics values for each point (within a buffer) directly from the point cloud.
+
+NOTE: must rerun for each butterfly species and update file names accordingly - this script is currently set up to produce data for Prosotas nora only.
+
+## Load data and match CRS
+
+```{r}
+
+library(rgdal)
+
+HK <- readOGR(dsn = "C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/Shapefiles/HK_outline.shp")
+
+lidar2 <- readOGR(dsn = "C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/LiDARTileShapefile2020/LiDARTiles_2020.shp")
+
+library(sf)
+library(raster)
+
+st_crs(HK)
+#st_crs(points)
+st_crs(lidar2)
+
+#points <- spTransform(points, crs(lidar2))
+HK <- spTransform(HK, crs(lidar2))
+
+```
+
+## use spThin to randomly remove records within given distance of a point and maintain the max number of points possible.
+
+```{R}
+#  for sampling bias
+#library(spThin)
+# Format Data with pseudo-absences : random method
+library(dismo)
+
+
+# load a HK raster to sample points randomly.
+HK_raster <- raster("C:/Users/TCB-Martha/OneDrive - The University of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/2020thinned_openarea.tif")
+
+# str(data_LC)
+# data_LC$Lat <- as.numeric(data_LC$Lat)
+# data_LC$Lon <- as.numeric(data_LC$Lon)
+# data_LC <- na.exclude(data_LC)
+# 
+# # create bias mask here
+# data_LC_thin <- thin(data_LC, lat.col = "Lat", long.col = "Lon", spec.col = "presence", thin.par = 0.1, reps = 1000, out.dir = "C:/Users/TCB-Martha/OneDrive - The University of Hong Kong/HKU/Butterflies/Data/Butterfly_records/") # thin.par is distance between points in km
+
+# read in first generated file from thin() function
+data_LC <- read.csv("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/Butterfly_records/Prosotas_nora_2020_biascorrected.csv")
+data_LC <- data_LC[, c(3, 2, 1)]
+
+# select X random background points (1:1 presence:absence)
+# set seed to assure that the examples will always
+# have the same random sample.
+set.seed(1)
+bg <- as.data.frame(randomPoints(HK_raster, n = 89, p = data_LC[, 2:3])) # change number to match the number of observations
+bg$presence <- 0
+bg <- bg[, c(2, 1, 3)]
+colnames(bg) <- c("Lat", "Lon", "presence")
+
+# bind presence and absence data
+
+data_LC <- rbind(data_LC, bg)
+
+# turn presence-absence data into a point shapefile in HK 1980 projection
+
+# Convert data frame to sf object
+coords <- cbind(data_LC$Lon, data_LC$Lat)
+points <- SpatialPointsDataFrame(coords, data_LC)
+class(points)
+dim(points) 
+
+# Include the TSD projection system to the point shapefile
+# ---------------
+proj4string(points) <- "+proj=tmerc +lat_0=22.3121333333333 +lon_0=114.178555555556 +k=1 +x_0=836694.05 +y_0=819069.8 +ellps=intl +towgs84=-162.619,-276.959,-161.764,-0.067753,2.243648,1.158828,-1.094246 +units=m +no_defs +type=crs"
+
+# Check that the points overlap with the LiDAR data...
+plot(lidar2)
+plot(points, add = T)
+
+```
+
+## Intersect
+
+Now intersect the points with the LiDAR shapefile and generate a list of required LiDAR tiles.
+
+```{r}
+
+intersected <- raster::intersect(lidar2, points)
+intersected_df <- intersected@data # isolates the data frame from the 'SpatialPolygonsDataFrame'
+intersected_df$ID <- row.names(intersected_df)
+
+library(dplyr)
+
+req_lidar2 <- intersected_df %>%
+  group_by(FileName) %>%
+  summarise(nofobs = length(FileName))
+
+```
+
+## Create catalog
+
+'LAScatalog' objects hold the names of all of your .las files from a specified folder and import the relevant tiles when required. This automates the process of importing .las files and keeps the Global Environment free from being filled up with unnecessary unprocessed data.
+
+```{r}
+
+workingdirectory <- "D:/HK_LiDAR/2020/Thinned/Thinned_only"
+
+setwd(workingdirectory)
+
+library(lidR)
+
+ctg <- catalog(workingdirectory)
+
+```
+
+#**Subset relevant tiles**
+
+NOTE: Sometimes, multiple points lie within one .las tile. The subset generated therefore produces a 'list' object type, rather than a 'las' object, which lidR tools cannot compute. An if/else statement is therefore included in the subsetting so that any 'list' objects that are produced are saved as separate .las files for processing.
+
+We write the .las tile names as files and as a name in a list as we go so that we can call them later for processing.
+
+```{r}
+
+LiDAR_files_points_25 <- c()
+
+for (i in seq(1, length(req_lidar2$FileName), 1)){
+  print(req_lidar2$FileName[i])
+  subset <- clip_roi(ctg, intersected[intersected@data$FileName==req_lidar2$FileName[i],], radius = 25) # subset las files based on the name listed in req_lidar2
+  
+  if (typeof(subset) == "list"){
+    
+    for (j in 1:length(subset)){
+
+      if (subset[[j]]@header@PHB$"Number of point records">0) {
+        writeLAS(subset[[j]],paste("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/Prosotas_nora/2020_thinned/Clipped_25/pointclip25_", req_lidar2$FileName[i], "_", j, ".laz", sep=""))
+      }
+      
+      LiDAR_files_points_25[[length(LiDAR_files_points_25) + 1]] <- paste("pointclip25_", req_lidar2$FileName[i], "_", j, ".laz", sep="")
+    }
+    
+  } else {
+  
+    if (subset@header@PHB$"Number of point records">0) {
+      writeLAS(subset,paste("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/Prosotas_nora/2020_thinned/Clipped_25/pointclip25_", req_lidar2$FileName[i], ".laz", sep=""))
+    }
+    
+    LiDAR_files_points_25[[length(LiDAR_files_points_25) + 1]] <- paste("pointclip25_", req_lidar2$FileName[i], ".laz", sep="")
+    
+    
+  }
+}
+
+# add ID column
+    LiDAR_files_points_25_withID <- cbind(LiDAR_files_points_25, intersected_df$ID)
+    colnames(LiDAR_files_points_25_withID) <- c("FileName", "ID")
+
+```
+
+#**Calculate 25 m metrics**
+
+The following metrics have been calculated to associate with butterfly presence and diversity:
+
+<table>
+Metrics                          Radius (m)        Vegetation                   Description
+----------------------------     ------------      --------------------         -------------------------------------------------------------------------------------------
+Less than 0.2 m density (%)       25               Herb/grass layer             Vegetation density as a proportion of returns below 0.2 m relative to all vegetation and ground points                                                                                   
+0.2-1 m density (%)               25               Tall herbs/low shrubs layer  Vegetation density as a proportion of returns within 0.2-1 m relative to all vegetation and ground points                                                                                
+1-5 m density (%)                 25               Shrub layer                  Vegetation density as a proportion of returns within 1-5 m relative to all vegetation and ground points                                                                                  
+5-20 m density (%)                25               Tree layer                   Vegetation density as a proportion of returns within 5-20 m relative to all vegetation and ground points                                                                                 
+More than 20 m density (%)        25               Canopy trees                 Vegetation density as a proportion of returns less than 20 m relative to all vegetation and ground points
+
+Height (m)                        25               Tall vegetation              90th percentile of normalised height of vegetation points                                                                                                                                
+Total veg roughness (m)           25               Total vegetation             Roughness of total vegetation Digital Surface Model (maximum difference in total vegetation height between focal and 8 neighbouring cells, averaged across all 1 m cells in 25 m radius) 
+Low veg roughness (m)             25               Low vegetation               Roughness of low vegetation Digital Surface Model (maximum difference in low vegetation height between focal and 8 neighbouring cells, averaged across all 1 m cells in 25 m radius)
+Elevation (m)                     25               N/A                          Mean elevation of ground surface derived from Digital Terrain model
+
+Slope (degrees)                   100              Microtopography              Mean slope derived from Digital Terrain model using maximum ground height difference between focal and 8 neighbouring 1 m cells in 100 m radius                                          
+Open area (ha)                    100              Extent of open vegetation    Total low vegetation area (cells with 90th percentile height of vegetation less than 1 m) cells separated by other cells in the Digital Surface Model in 100 m radius                            
+Open patches (count)              100              Patchiness of open areas     Number of patches of connected low vegetation (90th percentile height less than 1 m) and non-low vegetation cells in the Digital Surface Model in 100 m radius                                   
+Edge extent (m)                   100              Extent of woodland areas     Length of edges between interfacing low (90th percentile height less than 1 m) and non-low vegetation cells in the Digital Surface Model in 100 m radius                                 
+Land cover                        100              Vegetation, urban and watercourse categories (8)   Modal land cover
+</table>
+
+
+```{r}
+
+point_metrics_25 <- data.frame(matrix(ncol = 10, nrow = 0))
+
+for(i in LiDAR_files_points_25) {
+  print(i)
+  
+  if(file.exists(paste("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/Prosotas_nora/2020_thinned/Clipped_25/", i, sep = ""))) {
+    
+    las <- readLAS(paste("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/Prosotas_nora/2020_thinned/Clipped_25/", i, sep = ""))
+    
+    if(nrow(las@data[las@data$Classification == 2L]) != 0){
+    
+      dtm <- rasterize_terrain(las, algorithm = tin(), pkg ="terra")
+      
+      z <- mean(values(dtm, mat=TRUE, na.rm=T))
+      
+      las_norm <- normalize_height(las, knnidw(k = 10, p = 2))
+      
+      las_norm_veg <- filter_poi(las_norm, Classification == 2L | Classification == 3L | Classification == 4L | Classification == 5L)
+      
+      v_b02 <- (nrow(las_norm@data[(las_norm@data$Z<0.2)])/length(las_norm@data$Z))*100
+      v_02_1 <- (nrow(las_norm@data[(las_norm@data$Z>0.2 & las_norm@data$Z<1)])/length(las_norm@data$Z))*100
+      v_1_5 <- (nrow(las_norm@data[(las_norm@data$Z>1 & las_norm@data$Z<5)])/length(las_norm@data$Z))*100
+      v_5_20 <- (nrow(las_norm@data[(las_norm@data$Z>5 & las_norm@data$Z<20)])/length(las_norm@data$Z))*100
+      v_a20 <- (nrow(las_norm@data[(las_norm@data$Z>20)])/length(las_norm@data$Z))*100
+      
+      z090quantile <- as.numeric(quantile(las_norm_veg@data$Z, 0.90))
+      
+      # Extract horizontal variability and proportion related metrics
+      
+      dsm <- grid_metrics(las_norm, ~quantile(Z, 0.90), res=1)
+      dsm_b1 <- grid_metrics(las_norm, ~mean(Z[Z<1]), res=1)
+  
+      tri_dsm <- terrain(dsm, opt = "roughness", neighbors=8)
+      tri_dsm_b1 <- terrain(dsm_b1, opt = "roughness", neighbors=8)
+      
+      tri_dsm_mean <- cellStats(tri_dsm, "mean")
+      tri_dsm_mean_b1 <- cellStats(tri_dsm_b1, "mean")
+      
+      v_metrics <- as.data.frame(t(c(paste(i), v_b02, v_02_1, v_1_5, v_5_20, v_a20, z090quantile, tri_dsm_mean, tri_dsm_mean_b1, z)))
+     
+      point_metrics_25 <- rbind(point_metrics_25, v_metrics)
+    
+      }
+    }
+}
+
+library(stringr)
+  
+colnames(point_metrics_25) <- c("FileName", "<0.2 m density (%)", "0.2-1 m density (%)",
+                                "1-5 m m density (%)", "5-20 m density (%)",
+                                ">20 m density (%)", "Height (m)", 
+                                "Total veg roughness (m)", "Low veg roughness (m)", "Elevation (m)")
+
+point_metrics_25 <- merge(point_metrics_25, LiDAR_files_points_25_withID, by = "FileName")
+
+```
+
+# **Calculate 100 m metrics**
+
+We rewrite the subset LiDAR files again with 100 m radius.
+
+# **Subset relevant tiles**
+
+```{r}
+
+LiDAR_files_points_100 <- c()
+
+for (i in seq(1, length(req_lidar2$FileName), 1)){ 
+  print(req_lidar2$FileName[i]) 
+  subset <- clip_roi(ctg, intersected[intersected@data$FileName==req_lidar2$FileName[i],], radius = 100) # subset las files based on the name listed in req_lidar2
+  
+  if (typeof(subset) == "list"){
+    
+    for (j in 1:length(subset)){
+      
+      if (subset[[j]]@header@PHB$"Number of point records">0) {
+        writeLAS(subset[[j]],paste("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/Prosotas_nora/2020_thinned/Clipped_100/pointclip100_", req_lidar2$FileName[i], "_", j, ".laz", sep=""))
+      }
+      
+      LiDAR_files_points_100[[length(LiDAR_files_points_100) + 1]] <- paste("pointclip100_", req_lidar2$FileName[i], "_", j, ".laz", sep="")
+    }
+    
+  } else {
+    
+    if (subset@header@PHB$"Number of point records">0) {
+      writeLAS(subset,paste("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/Prosotas_nora/2020_thinned/Clipped_100/pointclip100_", req_lidar2$FileName[i], ".laz", sep=""))
+    }
+    
+    LiDAR_files_points_100[[length(LiDAR_files_points_100) + 1]] <- paste("pointclip100_", req_lidar2$FileName[i], ".laz", sep="")
+    
+  }
+}
+
+# add ID column
+    LiDAR_files_points_100_withID <- as.data.frame(cbind(LiDAR_files_points_100, intersected_df$ID))
+    colnames(LiDAR_files_points_100_withID) <- c("FileName", "ID")
+
+```
+
+#**Calculate metrics
+
+```{r}
+library(terra)
+library(landscapemetrics)
+
+HK1980 <- st_crs(2326)
+
+m <- rast("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/2020thinned_urbanicity_binary.tif")
+
+point_metrics_100 <- data.frame(matrix(ncol = 6, nrow = 0))
+
+for (i in LiDAR_files_points_100) {
+  print(i)
+  
+  if (file.exists(paste("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/Prosotas_nora/2020_thinned/Clipped_100/", i, sep = ""))) {
+    
+    las <- readLAS(paste("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/Prosotas_nora/2020_thinned/Clipped_100/", i, sep = ""))
+    
+    st_crs(las) <- HK1980 # apply projection to las file
+        
+    if(nrow(las@data[las@data$Classification == 2L]) != 0){
+    
+      las_norm <- normalize_height(las, knnidw(k = 10, p = 2))
+      las_norm_veg <- filter_poi(las_norm, Classification==2L | Classification==3L | Classification==4L | Classification==5L)
+          
+          # Extract horizontal variability and proportion related metrics
+          
+          dsm <- grid_metrics(las_norm, ~quantile(Z, 0.90), res = 1)
+          dtm <- rasterize_terrain(las, algorithm = tin(), pkg ="terra")
+          
+          dtm_slope <- terrain(dtm, v = "slope", unit = "degrees", neighbors = 4)
+          
+          dtm_slope_mean <- as.numeric(global(dtm_slope, "mean", na.rm = T))
+          
+          # landscape metrics
+          
+          height_class <- reclassify(dsm, c(-Inf,2,0,2,5,1,5,Inf,2))
+          
+          class_area <- lsm_c_ca(height_class, directions = 8)
+          class_area_low <- class_area$value[2]
+          
+          total_edge <- lsm_c_te(height_class, directions = 8)
+          total_edge_low <- total_edge$value[2]
+          
+          nofpatches <- lsm_c_np(height_class, directions = 8)
+          nofpatches_low <- nofpatches$value[2]
+          
+          r <- dtm > -Inf
+          p <- as(terra::as.polygons(r, dissolve = T, values = F), "Spatial") #To create a mask
+          q <- raster::crop(raster::mask(raster(m), p), p) #To mask the DTM
+          LUHK <- as.numeric(cellStats(q, "mean")*100) # here calculate percentage of urban area
+          
+            # Export
+            
+            h_metrics <- as.data.frame(t(c(paste(i), dtm_slope_mean, class_area_low, 
+                                           total_edge_low, nofpatches_low, LUHK)))
+            
+            point_metrics_100 <- rbind(point_metrics_100, h_metrics)
+    }  
+  }
+}
+
+library(stringr)
+
+colnames(point_metrics_100) <- c("FileName", "Slope (degrees)", "Open area (ha)", "Open patches (count)", "Edge extent (m)", "Land cover")
+
+point_metrics_100 <- merge(point_metrics_100, LiDAR_files_points_100_withID, by = "FileName")
+
+```
+
+# **Merge metrics to one file and write csv**
+
+```{r}
+
+point_metrics_25$ID <- as.numeric(point_metrics_25$ID)
+point_metrics_100$ID <- as.numeric(point_metrics_100$ID)
+intersected_df$ID <- as.numeric(intersected_df$ID)
+
+all_metrics <- merge(point_metrics_25, point_metrics_100, by = "ID")#, all.x = T)
+all_metrics <- merge(intersected_df, all_metrics, by = "ID")#, all.x = T)
+
+# remove unnecessary columns
+all_metrics <- all_metrics[, c(-10, -20)]
+all_metrics$ID <- as.numeric(all_metrics$ID)
+
+# remove duplicated data
+all_metrics <- all_metrics[!duplicated(all_metrics[, 2:23]), ]
+
+colnames(all_metrics) <- c("Lat", "Lon", "ID", "FileName", "Pt_Count", "Pt_Spacing", "Z_Min", "Z_Max", "presence",
+                              "<0.2 m density (%)", "0.2-1 m density (%)", "1-5 m m density (%)", "5-20 m density (%)",
+                              ">20 m density (%)", "Height (m)", "Total veg roughness (m)", "Low veg roughness (m)", 
+                              "Elevation (m)", "Slope (degrees)", "Open area (ha)", "Open patches (count)", "Edge extent (m)", "Land cover")
+
+write.csv(all_metrics, "C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/Prosotas_nora/2020_thinned/Prosotas_nora_point_metrics_2020_thinned.csv", row.names = F)
+
+```

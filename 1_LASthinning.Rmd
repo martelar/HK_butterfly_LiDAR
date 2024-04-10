@@ -1,0 +1,348 @@
+---
+title: "LAS thinning"
+output: html_notebook
+date: 09-2023
+author: Martha Ledger
+---
+
+Aim is to thin 2020 data to match the intensity values of 2010 data.
+Using the decimate_points() function in 'lidr'
+
+# **lidR approach with decimate_points**
+This guide should help: https://cran.r-project.org/web/packages/lidR/vignettes/lidR-LAScatalog-engine.html.
+Can use a custom low-level API function with catalog_apply
+
+```{R}
+# read lascatalog for 2010 and 2020
+library(lidR)
+
+las_cat_2020 <- readLAScatalog("Z:/Data/2020_LiDAR/")
+HK1980 <- st_crs(2326) # set projection ('2326' is the HK1980 EPSG)
+st_crs(las_cat_2020) <- HK1980 # apply projection to las file
+summary(las_cat_2020)
+las_check(las_cat_2020)
+plot(las_cat_2020)
+
+las_cat_2010 <- readLAScatalog("Z:/Data/2010_LiDAR/Input")
+HK1980 <- st_crs(2326) # set projection ('2326' is the HK1980 EPSG)
+st_crs(las_cat_2010) <- HK1980 # apply projection to las file
+summary(las_cat_2010)
+las_check(las_cat_2010)
+plot(las_cat_2010)
+
+#FUNCTION:
+# call 2020 tile
+# make shapefile of outline
+# extract this from 2010 data
+# find intensity of extracted area
+# apply intensity to decimate_points on 2020 tile
+
+library(raster)
+
+thinning <- function(x, y){
+  las_2020 <- readLAS(x)                                                     # call 2020 tile
+  if (is.empty(las_2020)) return(NULL)                                       # check if it actually contain points
+  shp <- rasterize_terrain(las_2020, res = 10, knnidw())
+  shp <- shp > -Inf
+  shp <- rasterToPolygons(raster(shp), dissolve = T)                         # make shapefile of outline
+  las_2010 <- clip_roi(las_cat_2010, shp)                                    # extract this from 2010 data                      
+  las_thinned <- decimate_points(las_2020, homogenize(density(las_2010), res = 100)) # apply 2010 density to decimate_points on 2020 tile
+  return(las_thinned)
+  }
+
+library(future)
+plan(multisession)
+opt_output_files(las_cat_2020) <- "D:/HK_LiDAR/2020/Thinned/Thinned_only/{ORIGINALFILENAME}"
+opt_stop_early(las_cat_2020) <- FALSE # bypasses errors
+out <- catalog_apply(las_cat_2020, thinning)
+
+##### check thinned output #####
+
+las_cat_thin_2020 <- readLAScatalog("D:/HK_LiDAR/2020/Thinned/Thinned_only/")
+HK1980 <- st_crs(2326) # set projection ('2326' is the HK1980 EPSG)
+st_crs(las_cat_thin_2020) <- HK1980 # apply projection to las file
+summary(las_cat_thin_2020)
+las_check(las_cat_thin_2020)
+
+library(raster)
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+  
+LAScompare <- data.frame(matrix(ncol = 3, nrow = 0))
+colnames(LAScompare) <- c("LAS_2010", "LAS_2020", "LAS_2020_thin")
+
+LASfiles = list.files("Z:/Data/2020_LiDAR/")
+
+for(i in LASfiles){
+  tryCatch({
+    print(i)
+    las_2020 <- readLAS(paste("Z:/Data/2020_LiDAR/", i, sep = ""))    # call 2020 tile
+      if (is.empty(las_2020)) return(NULL)   # check if it actually contain points
+    shp <- rasterize_terrain(las_2020, res = 10, knnidw())
+    shp <- shp > -Inf
+    shp <- rasterToPolygons(raster(shp), dissolve = T) # make shapefile of outline
+    las_2010 <- clip_roi(las_cat_2010, shp)
+    las_2020_thin <- clip_roi(las_cat_thin_2020, shp)
+    LAScompare <- LAScompare %>% add_row(LAS_2010 = density(las_2010), LAS_2020 = density(las_2020), LAS_2020_thin = density(las_2020_thin))
+    }, error=function(e){})
+  }
+
+str(LAScompare)
+
+p <- ggscatter(LAScompare, x = "LAS_2010", y = "LAS_2020",
+               size = 3,
+               cor.coef = TRUE, cor.method = "Pearson",
+               xlab = "LAS 2010", ylab = "LAS 2020")
+p + geom_smooth(method=lm , color="red", fill="grey", se=TRUE)
+
+p <- ggscatter(LAScompare, x = "LAS_2010", y = "LAS_2020_thin",
+               size = 3,
+               cor.coef = TRUE, cor.method = "Pearson",
+               xlab = "LAS 2010", ylab = "LAS 2020 thin")
+p + geom_smooth(method=lm , color="red", fill="grey", se=TRUE)
+
+p <- ggscatter(LAScompare, x = "LAS_2020", y = "LAS_2020_thin",
+               size = 3,
+               cor.coef = TRUE, cor.method = "Pearson",
+               xlab = "LAS 2020", ylab = "LAS 2020 thin")
+p + geom_smooth(method=lm , color="red", fill="grey", se=TRUE)
+
+
+
+```
+
+#**Correlate metric outputs derived from 2020 original and thinned data**
+Important for analysing the impact of the thinning process on habitat metrics.
+
+```{R}
+library(terra)
+
+# below 02
+below02 <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/HK_wide_metrics/vertical_metrics_below02_HK.tif")
+below02_thin <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/vertical_metrics_below_02_HK_2020thinned.tif")
+
+res(below02)
+res(below02_thin)
+
+below02 <- resample(below02, below02_thin, "bilinear")
+
+plot(below02, main = '2020 original')
+plot(below02_thin, main = '2020 thinned')
+plot(below02, below02_thin, xlab = '2020 original', ylab = '2020 thinned')
+
+raster_stack <- stack(below02, below02_thin)
+
+jnk=layerStats(raster_stack, 'pearson', na.rm=T)
+corr_matrix=jnk$'pearson correlation coefficient'
+
+
+# betw02_1
+betw02_1 <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/HK_wide_metrics/vertical_metrics_betw_021_HK.tif")
+betw02_1_thin <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/vertical_metrics_betw02_1_HK_2020thinned.tif")
+
+res(betw02_1)
+res(betw02_1_thin)
+
+betw02_1 <- resample(betw02_1, betw02_1_thin, "bilinear")
+
+plot(betw02_1, main = '2020 original')
+plot(betw02_1_thin, main = '2020 thinned')
+plot(betw02_1, betw02_1_thin, xlab = '2020 original', ylab = '2020 thinned')
+
+raster_stack <- stack(betw02_1, betw02_1_thin)
+
+jnk=layerStats(raster_stack, 'pearson', na.rm=T)
+corr_matrix=jnk$'pearson correlation coefficient'
+
+
+# betw 1-5
+betw1_5 <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/HK_wide_metrics/vertical_metrics_betw_15_HK.tif")
+betw1_5_thin <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/vertical_metrics_betw_1_5_HK_2020thinned.tif")
+
+res(betw1_5)
+res(betw1_5_thin)
+
+betw1_5 <- resample(betw1_5, betw1_5_thin, "bilinear")
+
+plot(betw1_5, main = '2020 original')
+plot(betw1_5_thin, main = '2020 thinned')
+plot(betw1_5, betw1_5_thin, xlab = '2020 original', ylab = '2020 thinned')
+
+raster_stack <- stack(betw1_5, betw1_5_thin)
+
+jnk=layerStats(raster_stack, 'pearson', na.rm=T)
+corr_matrix=jnk$'pearson correlation coefficient'
+
+
+# betw 5-20
+betw5_20 <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/HK_wide_metrics/vertical_metrics_betw_520_HK.tif")
+betw5_20_thin <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/vertical_metrics_betw_5_20_HK_2020thinned.tif")
+
+res(betw5_20)
+res(betw5_20_thin)
+
+betw5_20 <- resample(betw5_20, betw5_20_thin, "bilinear")
+
+plot(betw5_20, main = '2020 original')
+plot(betw5_20_thin, main = '2020 thinned')
+plot(betw5_20, betw5_20_thin, xlab = '2020 original', ylab = '2020 thinned')
+
+raster_stack <- stack(betw5_20, betw5_20_thin)
+
+jnk=layerStats(raster_stack, 'pearson', na.rm=T)
+corr_matrix=jnk$'pearson correlation coefficient'
+
+
+# above20
+above20 <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/HK_wide_metrics/vertical_metrics_above20_HK.tif")
+above20_thin <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/vertical_metrics_above_20_HK_2020thinned.tif")
+
+res(above20)
+res(above20_thin)
+
+above20 <- resample(above20, above20_thin, "bilinear")
+
+plot(above20, main = '2020 original')
+plot(above20_thin, main = '2020 thinned')
+plot(above20, above20_thin, xlab = '2020 original', ylab = '2020 thinned')
+
+raster_stack <- stack(above20, above20_thin)
+
+jnk=layerStats(raster_stack, 'pearson', na.rm=T)
+corr_matrix=jnk$'pearson correlation coefficient'
+
+
+# chm
+chm <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/HK_wide_metrics/2020_CHM.tif")
+chm_thin <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/2020thinned_CHM.tif")
+
+res(chm)
+res(chm_thin)
+
+chm <- resample(chm, chm_thin, "bilinear")
+
+plot(chm, main = '2020 original')
+plot(chm_thin, main = '2020 thinned')
+plot(chm, chm_thin, xlab = '2020 original', ylab = '2020 thinned')
+
+raster_stack <- stack(chm, chm_thin)
+
+jnk=layerStats(raster_stack, 'pearson', na.rm=T)
+corr_matrix=jnk$'pearson correlation coefficient'
+
+
+# dtm
+dtm <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/HK_wide_metrics/2020_DTM.tif")
+dtm_thin <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/2020thinned_DTM.tif")
+
+res(dtm)
+res(dtm_thin)
+
+dtm <- resample(dtm, dtm_thin, "bilinear")
+
+plot(dtm, main = '2020 original')
+plot(dtm_thin, main = '2020 thinned')
+plot(dtm, dtm_thin, xlab = '2020 original', ylab = '2020 thinned')
+
+raster_stack <- stack(dtm, dtm_thin)
+
+jnk=layerStats(raster_stack, 'pearson', na.rm=T)
+corr_matrix=jnk$'pearson correlation coefficient'
+
+
+# slope
+slope <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/HK_wide_metrics/2020_slope.tif")
+slope_thin <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/2020thinned_slope.tif")
+
+res(slope)
+res(slope_thin)
+
+slope <- resample(slope, slope_thin, "bilinear")
+
+plot(slope, main = '2020 original')
+plot(slope_thin, main = '2020 thinned')
+plot(slope, slope_thin, xlab = '2020 original', ylab = '2020 thinned')
+
+raster_stack <- stack(slope, slope_thin)
+
+jnk=layerStats(raster_stack, 'pearson', na.rm=T)
+corr_matrix=jnk$'pearson correlation coefficient'
+
+
+# total rough
+total_rough <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/HK_wide_metrics/2020_total_roughness.tif")
+total_rough_thin <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/2020thinned_total_roughness.tif")
+
+res(total_rough)
+res(total_rough_thin)
+
+total_rough <- resample(total_rough, total_rough_thin, "bilinear")
+
+plot(total_rough, main = '2020 original')
+plot(total_rough_thin, main = '2020 thinned')
+plot(total_rough, total_rough_thin, xlab = '2020 original', ylab = '2020 thinned')
+
+raster_stack <- stack(total_rough, total_rough_thin)
+
+jnk=layerStats(raster_stack, 'pearson', na.rm=T)
+corr_matrix=jnk$'pearson correlation coefficient'
+
+
+# low_rough
+low_rough <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/HK_wide_metrics/2020_low_roughness.tif")
+low_rough_thin <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/2020thinned_low_roughness.tif")
+
+res(low_rough)
+res(low_rough_thin)
+
+low_rough <- resample(low_rough, low_rough_thin, "bilinear")
+
+plot(low_rough, main = '2020 original')
+plot(low_rough_thin, main = '2020 thinned')
+plot(low_rough, low_rough_thin, xlab = '2020 original', ylab = '2020 thinned')
+
+raster_stack <- stack(low_rough, low_rough_thin)
+
+jnk=layerStats(raster_stack, 'pearson', na.rm=T)
+corr_matrix=jnk$'pearson correlation coefficient'
+
+
+# open_area
+open_area <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/HK_wide_metrics/2020_openarea_predict_ha.tif")
+open_area_thin <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/2020thinned_openarea_predict_ha.tif")
+
+res(open_area)
+res(open_area_thin)
+
+open_area <- resample(open_area, open_area_thin, "bilinear")
+
+plot(open_area, main = '2020 original')
+plot(open_area_thin, main = '2020 thinned')
+plot(open_area, open_area_thin, xlab = '2020 original', ylab = '2020 thinned')
+
+raster_stack <- stack(open_area, open_area_thin)
+
+jnk=layerStats(raster_stack, 'pearson', na.rm=T)
+corr_matrix=jnk$'pearson correlation coefficient'
+
+
+# open_patches
+open_patches <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/HK_wide_metrics/2020_openpatches_predict.tif")
+open_patches_thin <- raster("C:/Users/TCB-Martha/OneDrive - The University Of Hong Kong/HKU/Butterflies/Data/HK_RS_data/2020/L2Processed_Martha/H4/2020thinned_openpatches_predict.tif")
+
+res(open_patches)
+res(open_patches_thin)
+
+open_patches <- resample(open_patches, open_patches_thin, "bilinear")
+
+plot(open_patches, main = '2020 original')
+plot(open_patches_thin, main = '2020 thinned')
+plot(open_patches, open_patches_thin, xlab = '2020 original', ylab = '2020 thinned')
+
+raster_stack <- stack(open_patches, open_patches_thin)
+
+jnk=layerStats(raster_stack, 'pearson', na.rm=T)
+corr_matrix=jnk$'pearson correlation coefficient'
+
+```
